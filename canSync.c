@@ -5,9 +5,26 @@
 #include <sys/mman.h>
 #include <native/task.h>
 #include <native/timer.h>
+#include <native/pipe.h>
+#include <native/sem.h>
 #include <rtdm/rtcan.h>
 
 #define MAX_REGESTERED_CALBACKS 512
+
+#define SOUND_PORT_INTERN 0x61
+#define SOUND_PORT 0x378
+#define SOUND_BIT_INTERN 2
+#define SOUND_BIT 64
+#define SAMPLE_RATE 44100
+#define BUFFER_SECONDS 200
+
+#define POOLSIZE_IN_KB 32
+#define AUDIOBUFFER_SIZE_IN_KB 2
+#define BUFFER_COUNT 6
+
+RT_TASK beep_task;
+RT_TASK fill_buffer_task;
+
 
 int taskHasBeenStarted = 0;
 RT_TASK read_task;
@@ -25,6 +42,8 @@ typedef void(*FunctionPointer)();
 void time_signal();
 void start_music();
 FunctionPointer registered_callbacks[MAX_REGESTERED_CALBACKS] = {0};
+
+long start_music_time=0;
 
 void cleanup(int blubb){
 	printf("\nexit me\n");/*{{{*/
@@ -113,11 +132,14 @@ double meanOfDiffsBetweenLastOffsets(){
 	}
 	
 	return diffs/(COUNT_LAST_OFFSET_STORE-1);
-	//return diffs;
 }
 
 long getGlobalTime(long timestamp){
 	return calculatedTime+(timestamp-last_timestamp)*(1+meanOfDiffsBetweenLastOffsets());
+}
+
+long getLocalTime(long global_timestamp){
+	return last_timestamp+((global_timestamp-calculatedTime)/(1+meanOfDiffsBetweenLastOffsets()));
 }
 
 void time_signal(struct can_frame* frame, long timestamp){
@@ -127,7 +149,6 @@ void time_signal(struct can_frame* frame, long timestamp){
 		printf("The package is too long or too short! %i\n",frame->can_dlc);
 		return;
 	}
-
 
 	//Timestamp when the Server received its last Message
 	int dataIndex = 0;
@@ -149,7 +170,7 @@ void time_signal(struct can_frame* frame, long timestamp){
 	lastTimestamps[counter_last_offsets] = last_timestamp;
 
 	if(preparation_count_down == 0){
-		printf("lastCalc - lastServer = %ld\n", calculatedTime-receivedTime);
+		//printf("lastCalc - lastServer = %ld\n", calculatedTime-receivedTime);
 
 		calculatedTime-=(calculatedTime-receivedTime);
 		calculatedTime += (timestamp-last_timestamp)*(1.0+meanOfDiffsBetweenLastOffsets());
@@ -216,9 +237,74 @@ void readOnCanBus(){
 	}
 }
 
-void start_music(struct can_frame* frame, long timestamp){
-	printf("Leck mich einer fett\n");
-}
+typedef struct {
+	unsigned short buf [ 1024*AUDIOBUFFER_SIZE_IN_KB ];
+} audiobuf;
+
+audiobuf ring[BUFFER_COUNT];
+RT_PIPE xenomaiPipe;
+RT_SEM audiobuffer_semaphore_read;
+RT_SEM audiobuffer_semaphore_write;
+int next_write_area = 0;
+int next_read_area = 0;
+
+void beep(){
+  /*{{{*/
+	if(ioperm(SOUND_PORT,1,1)){
+		printf("NOT ALLOWED\n");
+	}
+
+	rt_sem_p(&audiobuffer_semaphore_read, TM_INFINITE);
+	RTIME start_time = start_music_time;
+	printf("Starte Musik in: %ldns\n",getLocalTime(start_time)-rt_timer_read());
+	rt_task_sleep_until(getLocalTime(start_time));
+	rt_sem_v(&audiobuffer_semaphore_read);
+	
+	int sampleInNS = 1000000000/SAMPLE_RATE;
+	
+	while(1){
+		rt_sem_p(&audiobuffer_semaphore_read, TM_INFINITE);
+		//printf("<play buffer %i>",next_read_area);
+
+	  int counter = 0;
+		while(counter<sizeof(ring[next_read_area].buf)/sizeof(ring[next_read_area].buf[0])){/*{{{*/
+		
+			//ON
+			outb(inb(SOUND_PORT)^SOUND_BIT,SOUND_PORT);
+			rt_task_sleep_until(
+					getLocalTime(start_time) +rt_timer_ns2ticks(
+						(sampleInNS*ring[next_read_area].buf[counter])>>16
+					)
+			);
+
+			//OFF
+			outb(inb(SOUND_PORT)^SOUND_BIT,SOUND_PORT);
+			start_time += rt_timer_ns2ticks(sampleInNS);
+			rt_task_sleep_until(getLocalTime(start_time));
+			counter++;
+		}/*}}}*/
+		next_read_area=(next_read_area+1)%BUFFER_COUNT;
+
+		//printf("</play>",next_read_area);
+		rt_sem_v(&audiobuffer_semaphore_write);
+	}
+
+	return;
+}/*}}}*/
+
+void fillBuffer(){
+		while(1){/*{{{*/
+			rt_sem_p(&audiobuffer_semaphore_write,TM_INFINITE);
+			//printf("< write in buffer %i.>",next_write_area);
+
+			rt_pipe_read(&xenomaiPipe, ring[next_write_area].buf, sizeof(ring[next_write_area].buf), TM_INFINITE);
+			next_write_area = (next_write_area+1)%BUFFER_COUNT;
+
+			//printf("</write>",next_write_area);
+			rt_sem_v(&audiobuffer_semaphore_read);
+		}
+}/*}}}*/
+
 
 int main () {
 	signal(SIGINT,cleanup);
@@ -239,6 +325,47 @@ int main () {
 	}
 	registered_callbacks[1] = time_signal;
 	registered_callbacks[256] = start_music;
+
+	//create pipe
+	int error = rt_pipe_create(&xenomaiPipe,"speakerpipe",P_MINOR_AUTO,POOLSIZE_IN_KB*1024);
+	if(error){
+		cleanup(error);
+		return;
+	}
+
+	//create semaphore
+	//TODO: Cleanup Semaphore
+	error = rt_sem_create(
+		&audiobuffer_semaphore_read,
+		"Read buffer semaphore",
+		0,
+		S_FIFO
+	);
+	error = rt_sem_create(
+		&audiobuffer_semaphore_write,
+		"write buffer semaphore",
+		BUFFER_COUNT,
+		S_FIFO
+	);
+	if(error){
+		cleanup(error);
+		return;
+	}
+
+	rt_task_create(
+		&fill_buffer_task,    // Task "object"
+		"Fill Buffer Task",  // Taskname
+		0, 	      		// stacksize
+		10, 	      	// priority
+		0             // option-flags
+	);
+	rt_task_create(
+		&beep_task,    // Task "object"
+		"Beep Task",  // Taskname
+		0, 	      		// stacksize
+		20, 	      	// priority
+		0             // option-flags
+	);
 
 	rt_task_create(
 		&read_task,    // Task "object"
@@ -263,3 +390,26 @@ int main () {
 	return 0;
 }
 
+void start_music(struct can_frame* frame, long timestamp){
+
+	int dataIndex = 0;
+	long globalStartTime = 0;
+	for(dataIndex=0; dataIndex < frame->can_dlc; dataIndex++){
+		globalStartTime =((long*)(frame->data))[0];
+	}
+
+	start_music_time = globalStartTime;
+
+	rt_task_start(
+			&fill_buffer_task,	// Task 
+			fillBuffer, 			// fuction pointer
+			NULL				// Data
+	);
+
+	rt_task_start(
+			&beep_task,	// Task 
+			beep, 			// fuction pointer
+			NULL				// Data
+	);
+
+}
